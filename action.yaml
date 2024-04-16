@@ -1,0 +1,142 @@
+name: Build & Run Trivy Scans
+description: ""
+
+inputs:
+  github_token:
+    type: string
+    require: false
+    description: "Github token"
+    default: ${{ github.token }}
+  private_docker_registry:
+    type: string
+    require: true
+    description: "Private registry to ignore private cert issues."
+  service_name:
+    type: string
+    require: true
+    description: "Name of service being built"
+  dockerfile:
+    type: string
+    require: false
+    description: "Path of Dockerfile"
+    default: ./Dockerfile
+  docker_tag:
+    type: string
+    require: true
+    description: "What tag should we apply to build to push"
+  push_build:
+    type: boolean
+    require: false
+    description: "Should we build the image after its build"
+    default: false
+  prevent_overwrite:
+    type: boolean
+    require: false
+    description: "If this is enabled, it prevent pushign images if there exists an image with the same tag"
+    default: true
+  trivy_vuln_type:
+    type: strin
+    require: false
+    description: "Format to display Trivy output"
+    default: table
+  trivy_scanners:
+    type: string
+    require: false
+    description: "Trivy scanners to use"
+    default: vuln,secret,config
+  trivy_severity:
+    type: string
+    require: false
+    description: "Severity levels to filter for Trivy"
+    default: HIGH,CRITICAL
+  trivy_format:
+    type: string
+    require: false
+    description: "Format to display Trivy output"
+    default: table
+  trivy_exit_code:
+    type: integer
+    require: false
+    description: "If there is an error, what exit code should be used"
+    default: 0
+  trivy_ignore_unfixed:
+    type: boolean
+    require: false
+    description: "Option to ignore unfixed items"
+    default: false
+
+runs:
+  using: 'composite'
+
+  steps:
+    - name: Check For Override
+      shell: bash
+      run: |
+        if ${{ inputs.push_build }} && ${{ inputs.prevent_overwrite }} ; then
+          resp=$(docker -D manifest inspect --insecure ${{ inputs.docker_tag }} || echo "false")
+          if [ "${resp}" != "false" ]; then
+            echo "The following image has already been built: ${{ inputs.docker_tag }}"
+            echo "Canceling build!"
+            exit 1
+          fi
+        fi
+
+    - name: Calculate Cache Bust Date
+      shell: bash
+      id: cache_bust
+      run: |
+        echo "CACHE_BUST_DATE=$(date +r%y%U)" >> $GITHUB_OUTPUT
+
+    - name: Setup directories
+      shell: bash
+      run: |
+        mkdir -p /tmp/.buildx-cache
+
+    - name: Checkout Repo
+      uses: actions/checkout@v4
+      with:
+        token: ${{ inputs.github_token }}
+        persist-credentials: true
+        submodules: recursive
+
+    - name: Create BuildKit Configuration
+      shell: bash
+      run: |
+        cat <<EOF > buildkitd.toml
+        [registry."${{ inputs.private_docker_registry }}"]
+          http = true
+          insecure = true
+        EOF
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        buildkitd-flags: --debug
+        buildkitd-config: buildkitd.toml
+
+    - name: Build & Push ${{ inputs.service_name }} Docker Image
+      uses: docker/build-push-action@v5
+      with:
+        file: ${{ inputs.dockerfile }}
+        context: .
+        build-args: |
+          BUILDKIT_PROGRESS=plain
+          TARGET_ENV=prod
+          WEEKLY_CACHE_BUST=${{ steps.cache_bust.outputs.CACHE_BUST_DATE }}
+        load: true
+        push: ${{ inputs.push_build }}
+        tags: ${{ inputs.docker_tag }}
+        cache-from: type=local,src=/tmp/.buildx-cache
+        cache-to: type=local,dest=/tmp/.buildx-cache
+
+    - name: Run Trivy vulnerability scanner agains ${{ inputs.service_name }}
+      uses: aquasecurity/trivy-action@master
+      with:
+        github-pat: ${{ inputs.github_token }}
+        image-ref: ${{ inputs.docker_tag }}
+        ignore-unfixed: ${{ inputs.trivy_ignore_unfixed }}
+        vuln-type: ${{ inputs.trivy_vuln_type }}
+        scanners: ${{ inputs.trivy_scanners }}
+        severity: ${{ inputs.trivy_severity }}
+        format: ${{ inputs.trivy_format }}
+        exit-code: ${{ inputs.trivy_exit_code }}
